@@ -18,17 +18,19 @@ radio.enableAckPayload()
 radio.openReadingPipe(1, b'1Node')
 radio.startListening()
 
-sensor_data = None
+# --- State variables ---
+parsed_sensor_data = None # <-- CHANGE: We'll store the dictionary here
 image_base64 = None
+# sensor_json_filename is no longer needed
 
 # ---------- Handshake ----------
-print("?? Waiting for handshake...")
+print("📡 Waiting for handshake...")
 while True:
     if radio.available():
         msg = radio.read(4)
         if msg == b'SYNC':
             radio.writeAckPayload(1, b'ACK')
-            print("?? Handshake complete.")
+            print("🤝 Handshake complete.")
             break
 
 # ---------- Receive Loop ----------
@@ -42,7 +44,7 @@ while True:
                 time.sleep(0.001)
 
             chunk_count = int.from_bytes(radio.read(1), "big")
-            print(f"?? Receiving {chunk_count} sensor chunks...")
+            print(f"📥 Receiving {chunk_count} sensor chunks...")
 
             received = bytearray()
             for i in range(chunk_count):
@@ -50,76 +52,88 @@ while True:
                     time.sleep(0.001)
                 chunk = radio.read(32)
                 received.extend(chunk)
-                print(f"?? Sensor chunk {i+1}/{chunk_count}", end="\r")
+                print(f"📦 Sensor chunk {i+1}/{chunk_count}", end="\r")
 
             try:
                 sensor_text = received.rstrip(b'\x00').decode()
-                print("\n? Sensor data received:")
+                print("\n✅ Sensor data received:")
                 print(sensor_text)
-                sensor_data = sensor_text
+
+                # --- Convert to a dictionary ---
+                parts = sensor_text.split("|")
+                temp_parsed_data = {
+                    "capture_timestamp": parts[0]
+                }
+
+                for item in parts[1:]:
+                    if ':' in item:
+                        key, value_raw = item.split(":", 1)
+                        # Clean the key to be a valid JSON key (e.g., remove 'T', 'H', 'P')
+                        clean_key = key.strip()
+                        # Clean the value to be just the number
+                        value = ''.join(c for c in value_raw if c.isdigit() or c == '.' or c == '-')
+                        try:
+                            temp_parsed_data[clean_key] = float(value)
+                        except (ValueError, TypeError):
+                            temp_parsed_data[clean_key] = value_raw # fallback to raw value
+                
+                # --- Store the parsed dictionary ---
+                parsed_sensor_data = temp_parsed_data # <-- CHANGE: Store the dictionary directly
+                print("👍 Sensor data parsed and ready for upload.")
+
             except Exception as e:
-                print("? Sensor decode error:", e)
+                print("❌ Failed to decode or parse sensor data:", e)
 
-        # ---------- IMAGE DATA ----------
+        # ---------- IMAGE DATA (No changes needed in this block) ----------
         elif prefix == b'IMAG':
-            print("\n??? Receiving image...")
-
-            while not radio.available():
-                time.sleep(0.001)
-
-            # Step 1: Read total image length
+            # This logic is working well, so we keep it as is.
             length_bytes = radio.read(4)
             total_len = int.from_bytes(length_bytes, "big")
-            print(f"?? Expected image size: {total_len} bytes")
-
-            # Step 2: Calculate how many 32-byte chunks
-            chunk_count = (total_len + 31) // 32
-            print(f"?? Receiving {chunk_count} image chunks...")
+            print(f"\n🖼️ Receiving image ({total_len} bytes)...")
 
             received = bytearray()
-            for i in range(chunk_count):
-                while not radio.available():
-                    time.sleep(0.001)
-                chunk = radio.read(32)
-                received.extend(chunk)
-                print(f"?? Image chunk {i+1}/{chunk_count}", end="\r")
+            while len(received) < total_len:
+                if radio.available():
+                    chunk = radio.read(32)
+                    received.extend(chunk)
+                time.sleep(0.002)
 
             try:
-                # Step 3: Trim and save image
-                image_bytes = bytes(received[:total_len])
-                img = Image.frombytes("RGB", (64, 64), image_bytes)
-
+                # Use slice to be safe against extra padding bytes
+                img = Image.frombytes("RGB", (64, 64), bytes(received[:total_len]))
                 filename = f"received_{uuid.uuid4().hex}.jpg"
                 img.save(filename)
-                print(f"\n? Image saved as {filename}")
+                print(f"✅ Image saved as {filename}")
 
                 with open(filename, "rb") as f:
                     image_base64 = base64.b64encode(f.read()).decode()
 
                 os.remove(filename)
             except Exception as e:
-                print("? Image decode error:", e)
+                print("❌ Image error:", e)
 
     # ---------- Upload When Both Are Ready ----------
-    if sensor_data and image_base64:
+    # <-- CHANGE: Check for the parsed dictionary now
+    if parsed_sensor_data and image_base64:
         firebase_url = "https://fire-authentic-f5c81-default-rtdb.firebaseio.com/image_log.json"
 
-        data = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "sensor_data": sensor_data,
+        # <-- CHANGE: The payload is now structured with a nested JSON object
+        upload_payload = {
+            "upload_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "sensor_readings": parsed_sensor_data, # Upload the whole dictionary
             "image_base64": image_base64
         }
 
         try:
-            res = requests.post(firebase_url, json=data)
+            res = requests.post(firebase_url, json=upload_payload)
             if res.status_code == 200:
-                print("? Uploaded to Firebase.")
+                print("✅ Uploaded structured data to Firebase.")
             else:
-                print("? Upload failed. Status code:", res.status_code)
+                print("❌ Upload failed. Status code:", res.status_code)
         except Exception as e:
-            print("? Firebase error:", e)
+            print("❌ Firebase error:", e)
 
-        # Reset state
-        sensor_data = None
+        # <-- CHANGE: Reset the new state variable
+        parsed_sensor_data = None
         image_base64 = None
-        print("?? Ready for next data set.")
+        print("🔄 Ready for next data set.")
