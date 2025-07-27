@@ -1,4 +1,3 @@
-# --- Receiver Code (Updated and More Robust) ---
 from RF24 import RF24
 from PIL import Image
 import time
@@ -6,8 +5,9 @@ import base64
 import requests
 import uuid
 import os
+import json
 
-# --- Radio setup (same as before) ---
+# Setup NRF24L01
 radio = RF24(22, 0)
 radio.begin()
 radio.setChannel(76)
@@ -18,124 +18,108 @@ radio.enableAckPayload()
 radio.openReadingPipe(1, b'1Node')
 radio.startListening()
 
-# It's a good idea to print the radio details to be sure it's working
-radio.printDetails()
-
 sensor_data = None
 image_base64 = None
 
-# ---------- Handshake (This part is working, no changes needed) ----------
-print("📡 Waiting for handshake...")
-handshake_complete = False
-while not handshake_complete:
+# ---------- Handshake ----------
+print("?? Waiting for handshake...")
+while True:
     if radio.available():
-        msg = radio.read(radio.getDynamicPayloadSize())
+        msg = radio.read(4)
         if msg == b'SYNC':
             radio.writeAckPayload(1, b'ACK')
-            print("🤝 Handshake complete.")
-            handshake_complete = True
-    time.sleep(0.01)
+            print("?? Handshake complete.")
+            break
 
 # ---------- Receive Loop ----------
 while True:
     if radio.available():
         prefix = radio.read(4)
 
-        # ---------- SENSOR DATA (Adding timeout for robustness) ----------
+        # ---------- SENSOR DATA ----------
         if prefix == b'SENS':
-            print("\n📥 Receiving sensor data...")
-            
-            # Wait for the chunk count packet with a timeout
-            start_time = time.time()
             while not radio.available():
-                if time.time() - start_time > 2.0: # 2 second timeout
-                    print("\n❌ Timed out waiting for sensor chunk count!")
-                    break
-            if not radio.available(): continue # If timed out, skip to next loop iteration
+                time.sleep(0.001)
 
             chunk_count = int.from_bytes(radio.read(1), "big")
-            print(f"Expecting {chunk_count} sensor chunks...")
+            print(f"?? Receiving {chunk_count} sensor chunks...")
 
-            # ... (rest of your sensor code is okay, but could also benefit from timeouts) ...
             received = bytearray()
             for i in range(chunk_count):
-                start_time = time.time()
                 while not radio.available():
-                     if time.time() - start_time > 2.0:
-                         print(f"\n❌ Timed out waiting for sensor chunk {i+1}!")
-                         break
-                if not radio.available(): break # Break from this for-loop
-                
+                    time.sleep(0.001)
                 chunk = radio.read(32)
                 received.extend(chunk)
-                print(f"Received sensor chunk {i+1}/{chunk_count}", end="\r")
+                print(f"?? Sensor chunk {i+1}/{chunk_count}", end="\r")
 
             try:
                 sensor_text = received.rstrip(b'\x00').decode()
-                print("\n✅ Sensor data received:")
+                print("\n? Sensor data received:")
                 print(sensor_text)
                 sensor_data = sensor_text
             except Exception as e:
-                print("\n❌ Failed to decode sensor data:", e)
+                print("? Sensor decode error:", e)
 
-
-        # ---------- IMAGE DATA (THIS IS THE CRITICAL FIX) ----------
+        # ---------- IMAGE DATA ----------
         elif prefix == b'IMAG':
-            # FIX: WAIT FOR THE IMAGE LENGTH PACKET TO ARRIVE
-            start_time = time.time()
-            while not radio.available():
-                if time.time() - start_time > 2.0: # 2 second timeout
-                    print("\n❌ Timed out waiting for image length packet!")
-                    break
-            # If we timed out, continue to the next main loop iteration
-            if not radio.available():
-                continue
+            print("\n??? Receiving image...")
 
+            while not radio.available():
+                time.sleep(0.001)
+
+            # Step 1: Read total image length
             length_bytes = radio.read(4)
             total_len = int.from_bytes(length_bytes, "big")
-            
-            # Sanity check the length. If it's crazy, something is wrong.
-            if total_len != 12288: # 64 * 64 * 3
-                print(f"\n❌ Received corrupt image length: {total_len}. Expected 12288. Aborting image reception.")
-                continue
+            print(f"?? Expected image size: {total_len} bytes")
 
-            print(f"\n🖼️ Receiving image ({total_len} bytes)...")
+            # Step 2: Calculate how many 32-byte chunks
+            chunk_count = (total_len + 31) // 32
+            print(f"?? Receiving {chunk_count} image chunks...")
 
             received = bytearray()
-            last_reception_time = time.time()
-            
-            # FIX: This loop now has a timeout
-            while len(received) < total_len:
-                if radio.available():
-                    chunk = radio.read(32)
-                    received.extend(chunk)
-                    last_reception_time = time.time() # Reset timeout
-                
-                # If we haven't received a chunk in over 2 seconds, give up
-                if time.time() - last_reception_time > 2.0:
-                    print(f"\n❌ Timed out receiving image data. Got {len(received)}/{total_len} bytes.")
-                    break
-            
-            # Only proceed if we received all the data
-            if len(received) >= total_len:
-                try:
-                    # Slice the buffer to the exact expected size to avoid errors from extra bytes
-                    img_bytes = bytes(received[:total_len])
-                    img = Image.frombytes("RGB", (64, 64), img_bytes)
-                    filename = f"received_{uuid.uuid4().hex}.jpg"
-                    img.save(filename)
-                    print(f"\n✅ Image saved as {filename}")
+            for i in range(chunk_count):
+                while not radio.available():
+                    time.sleep(0.001)
+                chunk = radio.read(32)
+                received.extend(chunk)
+                print(f"?? Image chunk {i+1}/{chunk_count}", end="\r")
 
-                    with open(filename, "rb") as f:
-                        image_base64 = base64.b64encode(f.read()).decode()
+            try:
+                # Step 3: Trim and save image
+                image_bytes = bytes(received[:total_len])
+                img = Image.frombytes("RGB", (64, 64), image_bytes)
 
-                    os.remove(filename)
-                except Exception as e:
-                    print("\n❌ Image processing error:", e)
+                filename = f"received_{uuid.uuid4().hex}.jpg"
+                img.save(filename)
+                print(f"\n? Image saved as {filename}")
 
-    # ---------- Upload Logic (no changes needed) ----------
+                with open(filename, "rb") as f:
+                    image_base64 = base64.b64encode(f.read()).decode()
+
+                os.remove(filename)
+            except Exception as e:
+                print("? Image decode error:", e)
+
+    # ---------- Upload When Both Are Ready ----------
     if sensor_data and image_base64:
-        # ... your upload code ...
-        print("✅ Data uploaded. Resetting for next transmission.")
+        firebase_url = "https://fire-authentic-f5c81-default-rtdb.firebaseio.com/image_log.json"
+
+        data = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "sensor_data": sensor_data,
+            "image_base64": image_base64
+        }
+
+        try:
+            res = requests.post(firebase_url, json=data)
+            if res.status_code == 200:
+                print("? Uploaded to Firebase.")
+            else:
+                print("? Upload failed. Status code:", res.status_code)
+        except Exception as e:
+            print("? Firebase error:", e)
+
+        # Reset state
         sensor_data = None
         image_base64 = None
+        print("?? Ready for next data set.")
