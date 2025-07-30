@@ -1,80 +1,74 @@
 from RF24 import RF24
 from PIL import Image
 import time
-import camera
-from sense import read_environmental_data
+import camera # Assuming this is your camera library
+import uuid
 import os
 
-# --- Setup ---
-radio = RF24(22, 0) # Assumes CE=22, CSN=0 (GPIO25 if using SPI0,0)
+# --- Radio Setup --- (Same as before)
+radio = RF24(22, 0)
 radio.begin()
 radio.setChannel(76)
-radio.setPALevel(2, False) # Use RF24_PA_HIGH
+radio.setPALevel(2, False) # Use RF24_PA_MAX for better range
 radio.setAutoAck(True)
 radio.enableDynamicPayloads()
 radio.enableAckPayload()
 radio.openWritingPipe(b'1Node')
 radio.stopListening()
 
-# =============================================================================
-# FIXED: ROBUST HANDSHAKE
-# =============================================================================
-print("Attempting handshake...")
-# Send SYNC and wait for the custom ACK payload.
-# The write() will block until it gets a standard ACK. 
-# The isAckPayloadAvailable() checks if it also came with our custom payload.
-radio.write(b'SYNC') 
-if radio.isAckPayloadAvailable():
-    response = radio.read(radio.getDynamicPayloadSize())
-    if response == b'ACK':
-        print("✅ Handshake complete. Starting transfer.")
-    else:
-        print("❌ Handshake failed. Received wrong ACK. Exiting.")
-        exit()
-else:
-    print("❌ Handshake failed. No ACK received. Exiting.")
+# --- Function to reliably send a packet and wait for a specific ACK ---
+def send_and_wait_for_ack(payload, ack_payload, retries=5, timeout=0.2):
+    for _ in range(retries):
+        radio.write(payload)
+        
+        radio.startListening()
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if radio.available():
+                response = radio.read(radio.getDynamicPayloadSize())
+                if response == ack_payload:
+                    radio.stopListening()
+                    return True
+        radio.stopListening()
+        print(f"Timed out waiting for {ack_payload.decode()}, retrying...")
+    return False
+
+# ---------- 1. Handshake ----------
+print("📡 Attempting handshake...")
+if not send_and_wait_for_ack(b'START', b'ACK_START'):
+    print("❌ Handshake failed. Exiting.")
     exit()
+print("🤝 Handshake complete.")
 
-# =============================================================================
-# CONSISTENT SEND FUNCTION
-# =============================================================================
-def send_data(prefix, data_bytes):
-    """Sends data with a prefix and chunk-based protocol."""
-    global radio
-    chunk_size = 32
-    
-    # Pad the data to be a multiple of chunk_size
-    padding_needed = (chunk_size - (len(data_bytes) % chunk_size)) % chunk_size
-    data_bytes += b'\x00' * padding_needed
-    
-    chunks = [data_bytes[i:i+chunk_size] for i in range(0, len(data_bytes), chunk_size)]
-    chunk_count = len(chunks)
-
-    print(f"Sending prefix '{prefix.decode()}' with {chunk_count} chunks...")
-
-    # 1. Send prefix
-    radio.write(prefix)
-    
-    # 2. Send chunk count (as 1 byte)
-    radio.write(chunk_count.to_bytes(1, 'big'))
-    
-    # 3. Send all the chunks
-    for i, chunk in enumerate(chunks):
-        radio.write(chunk)
-    print(f"✅ Sent {prefix.decode()} data.")
-    time.sleep(0.05) # Small delay between SENS and IMAG blocks
-
-# ---------- Send Sensor Data ----------
-timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-env = read_environmental_data()
-sensor_text = f"{timestamp}|T:{env['temperature']:.2f}C|H:{env['humidity']:.2f}%|P:{env['pressure']:.2f}hPa"
-send_data(b'SENS', sensor_text.encode())
-
-# ---------- Send Image ----------
+# ---------- 2. Capture & Compress Image ----------
 filename = camera.capture_photo()
 img = Image.open(filename).convert("RGB").resize((64, 64))
-img_bytes = img.tobytes()
-os.remove(filename) # Clean up photo
-send_data(b'IMAG', img_bytes)
+jpeg_filename = f"/tmp/compressed_{uuid.uuid4().hex}.jpg"
+img.save(jpeg_filename, format="JPEG", quality=50)
+with open(jpeg_filename, "rb") as f:
+    jpeg_bytes = f.read()
+os.remove(jpeg_filename)
+print(f"📦 JPEG size: {len(jpeg_bytes)} bytes")
 
-print("\n🚀 All data sent.")
+# ---------- 3. Send Metadata ----------
+print("✉️ Sending image size...")
+if not send_and_wait_for_ack(len(jpeg_bytes).to_bytes(4, 'big'), b'ACK_META'):
+    print("❌ Failed to send metadata. Exiting.")
+    exit()
+print("✅ Receiver acknowledged metadata.")
+
+# ---------- 4. Send Image in Confirmed Chunks ----------
+chunk_size = 32
+chunks = [jpeg_bytes[i:i+chunk_size] for i in range(0, len(jpeg_bytes), chunk_size)]
+
+for i, chunk in enumerate(chunks):
+    if len(chunk) < chunk_size: # Pad the last chunk
+        chunk += b'\x00' * (chunk_size - len(chunk))
+    
+    ack_needed = f"ACK{i}".encode()
+    print(f"📤 Sending chunk {i+1}/{len(chunks)}...")
+    if not send_and_wait_for_ack(chunk, ack_needed, retries=8):
+        print(f"❌ FAILED to send chunk {i+1}. Aborting transfer.")
+        break
+else: # This 'else' belongs to the 'for' loop, it runs only if the loop completed without a 'break'
+    print("✅✅✅ All chunks sent and acknowledged! Transfer successful.")
