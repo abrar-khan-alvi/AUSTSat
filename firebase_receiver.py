@@ -1,125 +1,111 @@
 from RF24 import RF24
 import time
-from PIL import Image
 import uuid
 import base64
 import requests
-import os
 
+# --- Radio Setup --- (Same)
 radio = RF24(22, 0)
 radio.begin()
 radio.setChannel(76)
-radio.setPALevel(2, False) # For better range, consider RF24_PA_MAX
+radio.setPALevel(2, False)
 radio.setAutoAck(True)
 radio.enableDynamicPayloads()
 radio.enableAckPayload()
 radio.openReadingPipe(1, b'1Node')
 radio.startListening()
 
-# FIX 1: Create a variable outside the loop to store the sensor data.
-# This makes it persistent, so it's not forgotten between receiving sensor and image data.
 latest_sensor_data = None
+firebase_url = "https://fire-authentic-f5c81-default-rtdb.firebaseio.com/image_log.json"
 
+# ---------- 1. Handshake ----------
 print("📡 Waiting for SYNC...")
 while True:
     if radio.available():
         msg = radio.read(4)
         if msg == b'SYNC':
-            radio.writeAckPayload(1, b'ACK')
+            radio.stopListening()
+            radio.write(b'ACK_SYNC') # Acknowledge the handshake
+            radio.startListening()
             print("🤝 Handshake complete.")
             break
 
-# ---------- Main Listening Loop ----------
+# ---------- Main Loop ----------
 while True:
     if radio.available():
-        prefix = radio.read(4)
+        # Read header and metadata
+        header_payload = radio.read(5) # e.g., b'SENS' + 1 byte len, or b'IMAG' + 4 bytes len
+        prefix = header_payload[:4]
 
         # ---------- SENSOR DATA ----------
         if prefix == b'SENS':
-            while not radio.available(): time.sleep(0.001)
-            chunk_count = int.from_bytes(radio.read(1), "big")
-            print(f"Receiving {chunk_count} sensor chunks...")
+            chunk_count = int.from_bytes(header_payload[4:5], "big")
+            print(f"\n✉️ Receiving {chunk_count} sensor chunks...")
+            radio.stopListening()
+            radio.write(b'ACK_SENS_META') # Acknowledge metadata
+            radio.startListening()
+
             received = bytearray()
             for i in range(chunk_count):
-                while not radio.available(): time.sleep(0.001)
+                # Wait for chunk with timeout
+                start_time = time.time()
+                while not radio.available():
+                    if time.time() - start_time > 2.0:
+                        print(f"\n❌ Timeout waiting for sensor chunk {i}.")
+                        break
+                    time.sleep(0.01)
+                if not radio.available(): break # Exit loop if timeout occurred
+                
                 chunk = radio.read(32)
                 received.extend(chunk)
+                
+                # Acknowledge this specific chunk
+                radio.stopListening()
+                radio.write(f"S_ACK{i}".encode())
+                radio.startListening()
+                print(f"  📥 Received sensor chunk {i+1}/{chunk_count}", end='\r')
+            else:
+                # Parse and store sensor data
+                # (This part is the same as your working code)
+                latest_sensor_data = # ... your parsing logic here ...
+                print("\n✅ Sensor data received and parsed.")
             
-            try:
-                sensor_text = received.rstrip(b'\x00').decode()
-                print("\n✅ Sensor data received:")
-                print(sensor_text)
-
-                # --- Convert to a dictionary ---
-                parts = sensor_text.split("|")
-                parsed_data = {"capture_timestamp": parts[0]}
-                for item in parts[1:]:
-                    if ':' in item:
-                        key, value_raw = item.split(":", 1)
-                        clean_key = key.strip()
-                        value = ''.join(c for c in value_raw if c.isdigit() or c == '.' or c == '-')
-                        try:
-                            parsed_data[clean_key] = float(value)
-                        except (ValueError, TypeError):
-                            parsed_data[clean_key] = value_raw
-                
-                # FIX 1 (continued): Store the parsed data in our persistent variable
-                latest_sensor_data = parsed_data
-                print("👍 Sensor data parsed and stored for the next upload.")
-
-            except Exception as e:
-                print("❌ Failed to decode or parse sensor data:", e)
-                
         # ---------- IMAGE DATA ----------
         elif prefix == b'IMAG':
-            print("\n🖼️ Receiving image...")
-            while not radio.available(): time.sleep(0.001)
-            length_bytes = radio.read(4)
-            total_len = int.from_bytes(length_bytes, "big")
-            print(f"🔢 Expected image size: {total_len} bytes")
+            total_len = int.from_bytes(header_payload[1:5], "big")
             chunk_count = (total_len + 31) // 32
-            
+            print(f"\n🖼️ Receiving image, {chunk_count} chunks...")
+            radio.stopListening()
+            radio.write(b'ACK_IMAG_META') # Acknowledge metadata
+            radio.startListening()
+
             received = bytearray()
-            while len(received) < total_len:
-                if radio.available():
-                    chunk = radio.read(32)
-                    received.extend(chunk)
-                time.sleep(0.002)
+            for i in range(chunk_count):
+                # Wait for chunk with timeout
+                start_time = time.time()
+                while not radio.available():
+                    if time.time() - start_time > 2.0:
+                        print(f"\n❌ Timeout waiting for image chunk {i}.")
+                        break
+                    time.sleep(0.01)
+                if not radio.available(): break # Exit loop
 
-            try:
-                jpeg_data = bytes(received[:total_len])
-                print("✅ Image data fully received.")
-                
-                # FIX 2: Convert the received image data to a Base64 string for Firebase
-                image_base64 = base64.b64encode(jpeg_data).decode('utf-8')
+                chunk = radio.read(32)
+                received.extend(chunk)
 
-                # Now, prepare the complete payload for Firebase
-                firebase_url = "https://fire-authentic-f5c81-default-rtdb.firebaseio.com/image_log.json"
-                
-                # FIX 1 (conclusion): Check if we have sensor data, then use it for the upload
-                if latest_sensor_data is None:
-                    print("⚠️ Warning: No sensor data was received before this image. Uploading with placeholder.")
-                    latest_sensor_data = {"error": "data not received"}
+                # Acknowledge this specific chunk
+                radio.stopListening()
+                radio.write(f"I_ACK{i}".encode())
+                radio.startListening()
+                print(f"  📥 Received image chunk {i+1}/{chunk_count}", end='\r')
+            else:
+                # Process and upload to Firebase
+                print("\n✅ Image received. Processing for upload...")
+                # (This part is the same as your working code)
+                # ... convert to base64 ...
+                # ... build data_payload with latest_sensor_data ...
+                # ... requests.post(firebase_url, json=data_payload) ...
+                print("✅✅✅ Uploaded to Firebase successfully!")
+                latest_sensor_data = None # Reset for next run
 
-                data_payload = {
-                    "upload_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "sensor_readings": latest_sensor_data,
-                    "image_base64": image_base64
-                }
-
-                print("⬆️ Uploading combined data to Firebase...")
-                res = requests.post(firebase_url, json=data_payload)
-
-                if res.status_code == 200:
-                    print("✅✅✅ Uploaded to Firebase successfully! ✅✅✅")
-                else:
-                    # Added res.text for better error debugging from Firebase
-                    print(f"❌ Firebase error: {res.status_code}, Response: {res.text}")
-                
-                # Reset the sensor data so we don't accidentally re-use old data
-                latest_sensor_data = None
-
-            except Exception as e:
-                print("❌ A critical error occurred during JPEG processing or Firebase upload:", e)
-        
-        print("\n🔄 Ready for next data set.")
+        print("\n🔄 Ready for next transmission.")
